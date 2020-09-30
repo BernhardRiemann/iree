@@ -57,126 +57,38 @@ ABSL_FLAG(std::string, inputs_file, "",
 
 namespace iree {
 namespace {
-
-StatusOr<std::string> GetModuleContentsFromFlags() {
-  IREE_TRACE_SCOPE0("GetModuleContentsFromFlags");
-  auto input_file = absl::GetFlag(FLAGS_input_file);
-  if (input_file.empty()) {
-    return InvalidArgumentErrorBuilder(IREE_LOC)
-           << "input_file must be specified";
-  }
-  return file_io::GetFileContents(input_file);
-}
-
-Status RunFunction(::benchmark::State& state,
-                   const std::string& function_name) {
-  IREE_TRACE_SCOPE0("iree-benchmark-module");
-
-  IREE_RETURN_IF_ERROR(iree_hal_module_register_types())
-      << "registering HAL types";
-  iree_vm_instance_t* instance = nullptr;
-  IREE_RETURN_IF_ERROR(
-      iree_vm_instance_create(iree_allocator_system(), &instance))
-      << "creating instance";
-
-  IREE_ASSIGN_OR_RETURN(auto module_data, GetModuleContentsFromFlags());
-  iree_vm_module_t* input_module = nullptr;
-  IREE_RETURN_IF_ERROR(LoadBytecodeModule(module_data, &input_module));
-
-  iree_hal_device_t* device = nullptr;
-  IREE_RETURN_IF_ERROR(CreateDevice(absl::GetFlag(FLAGS_driver), &device));
-  iree_vm_module_t* hal_module = nullptr;
-  IREE_RETURN_IF_ERROR(CreateHalModule(device, &hal_module));
-
-  iree_vm_context_t* context = nullptr;
-  // Order matters. The input module will likely be dependent on the hal module.
-  std::array<iree_vm_module_t*, 2> modules = {hal_module, input_module};
-  IREE_RETURN_IF_ERROR(iree_vm_context_create_with_modules(
-      instance, modules.data(), modules.size(), iree_allocator_system(),
-      &context))
-      << "creating context";
-
-  iree_vm_function_t function;
-  IREE_RETURN_IF_ERROR(input_module->lookup_function(
-      input_module->self, IREE_VM_FUNCTION_LINKAGE_EXPORT,
-      iree_string_view_t{function_name.data(), function_name.size()},
-      &function))
-      << "looking up function '" << function_name << "'";
-
-  IREE_RETURN_IF_ERROR(ValidateFunctionAbi(function));
-  IREE_ASSIGN_OR_RETURN(auto input_descs, ParseInputSignature(function));
-
-  vm::ref<iree_vm_list_t> inputs;
-  if (!absl::GetFlag(FLAGS_inputs_file).empty()) {
-    if (!absl::GetFlag(FLAGS_inputs).empty()) {
-      return InvalidArgumentErrorBuilder(IREE_LOC)
-             << "Expected only one of inputs and inputs_file to be set";
-    }
-    IREE_ASSIGN_OR_RETURN(
-        inputs, ParseToVariantListFromFile(input_descs,
-                                           iree_hal_device_allocator(device),
-                                           absl::GetFlag(FLAGS_inputs_file)));
-  } else {
-    IREE_ASSIGN_OR_RETURN(
-        inputs,
-        ParseToVariantList(input_descs, iree_hal_device_allocator(device),
-                           absl::GetFlag(FLAGS_inputs)));
-  }
-
-  IREE_ASSIGN_OR_RETURN(auto output_descs, ParseOutputSignature(function));
-
-  // Execute once to make sure any first-iteration outliers are eliminated (e.g.
-  // JITing the SPIR-V) and clearly separate out benchmark-related problems in
-  // future debugging.
-  {
-    vm::ref<iree_vm_list_t> outputs;
-    IREE_RETURN_IF_ERROR(
-        iree_vm_list_create(/*element_type=*/nullptr, output_descs.size(),
-                            iree_allocator_system(), &outputs));
-    IREE_RETURN_IF_ERROR(iree_vm_invoke(context, function, /*policy=*/nullptr,
-                                        inputs.get(), outputs.get(),
-                                        iree_allocator_system()));
-  }
-
-  for (auto _ : state) {
-    // No status conversions and conditional returns in the benchmarked inner
-    // loop.
-    vm::ref<iree_vm_list_t> outputs;
-    IREE_CHECK_OK(iree_vm_list_create(/*element_type=*/nullptr,
-                                      output_descs.size(),
-                                      iree_allocator_system(), &outputs));
-    IREE_CHECK_OK(iree_vm_invoke(context, function, /*policy=*/nullptr,
-                                 inputs.get(), outputs.get(),
-                                 iree_allocator_system()));
-  }
-
-  inputs.reset();
-  iree_vm_module_release(hal_module);
-  iree_vm_module_release(input_module);
-  iree_hal_device_release(device);
-  iree_vm_context_release(context);
-  iree_vm_instance_release(instance);
-  return OkStatus();
-}
-
-void BM_RunModule(benchmark::State& state, const std::string& function_name) {
-  // Delegate to a status-returning function so we can use the status macros.
-  IREE_CHECK_OK(RunFunction(state, function_name));
-}
-
-}  // namespace
-
-Status RegisterModuleBenchmarks() {
-  auto function_name = absl::GetFlag(FLAGS_entry_function);
-  if (function_name.empty()) {
-    return InvalidArgumentErrorBuilder(IREE_LOC)
-           << "Must specify an entry_function";
-  }
+void RegisterModuleBenchmarks(
+    std::string& function_name, iree_vm_context_t* context,
+    iree_vm_function_t function, iree_vm_list_t* inputs,
+    const std::vector<RawSignatureParser::Description>& output_descs) {
   auto benchmark_name = "BM_" + function_name;
-  benchmark::RegisterBenchmark(benchmark_name.c_str(),
-                               [function_name](benchmark::State& state) {
-                                 BM_RunModule(state, function_name);
-                               })
+  benchmark::RegisterBenchmark(
+      benchmark_name.c_str(),
+      [context, function, inputs,
+       output_descs](benchmark::State& state) -> void {
+        // Warmup run step.
+        {
+          vm::ref<iree_vm_list_t> outputs;
+          IREE_CHECK_OK(iree_vm_list_create(/*element_type=*/nullptr,
+                                            output_descs.size(),
+                                            iree_allocator_system(), &outputs));
+          IREE_CHECK_OK(iree_vm_invoke(context, function, /*policy=*/nullptr,
+                                       inputs, outputs.get(),
+                                       iree_allocator_system()));
+        }
+        // Benchmarking loop.
+        for (auto _ : state) {
+          // No status conversions and conditional returns in the benchmarked
+          // inner loop.
+          vm::ref<iree_vm_list_t> outputs;
+          IREE_CHECK_OK(iree_vm_list_create(/*element_type=*/nullptr,
+                                            output_descs.size(),
+                                            iree_allocator_system(), &outputs));
+          IREE_CHECK_OK(iree_vm_invoke(context, function, /*policy=*/nullptr,
+                                       inputs, outputs.get(),
+                                       iree_allocator_system()));
+        }
+      })
       // By default only the main thread is included in CPU time. Include all
       // the threads instead.
       ->MeasureProcessCPUTime()
@@ -190,8 +102,8 @@ Status RegisterModuleBenchmarks() {
       // significant digits. If we end up wanting precision beyond microseconds,
       // we can make this setting configurable with a custom command line flag.
       ->Unit(benchmark::kMillisecond);
-  return OkStatus();
 }
+}  // namespace
 }  // namespace iree
 
 int main(int argc, char** argv) {
@@ -230,7 +142,70 @@ int main(int argc, char** argv) {
       absl::flags_internal::OnUndefinedFlag::kIgnoreUndefined);
   ::benchmark::Initialize(&argc, argv);
   iree::InitializeEnvironment(&argc, &argv);
-  IREE_CHECK_OK(iree::RegisterModuleBenchmarks());
+
+  IREE_CHECK_OK(iree_hal_module_register_types());
+  iree_vm_instance_t* instance = nullptr;
+  IREE_CHECK_OK(iree_vm_instance_create(iree_allocator_system(), &instance));
+  auto input_file = absl::GetFlag(FLAGS_input_file);
+  if (input_file.empty()) {
+    printf("Must provide input_file.\n");
+    return 1;
+  }
+  auto module_data = iree::file_io::GetFileContents(input_file);
+  iree_vm_module_t* input_module = nullptr;
+  IREE_CHECK_OK(iree::LoadBytecodeModule(module_data.value(), &input_module));
+
+  // Create IREE's device and module.
+  iree_hal_device_t* device = nullptr;
+  IREE_CHECK_OK(iree::CreateDevice(absl::GetFlag(FLAGS_driver), &device));
+  iree_vm_module_t* hal_module = nullptr;
+  IREE_CHECK_OK(iree::CreateHalModule(device, &hal_module));
+  iree_vm_context_t* context = nullptr;
+
+  // Order matters. The input module will likely be dependent on the hal module.
+  std::array<iree_vm_module_t*, 2> modules = {hal_module, input_module};
+  IREE_CHECK_OK(iree_vm_context_create_with_modules(
+      instance, modules.data(), modules.size(), iree_allocator_system(),
+      &context));
+
+  // Lookup function from loaded module.
+  auto function_name = absl::GetFlag(FLAGS_entry_function);
+  iree_vm_function_t function;
+  IREE_CHECK_OK(input_module->lookup_function(
+      input_module->self, IREE_VM_FUNCTION_LINKAGE_EXPORT,
+      iree_string_view_t{function_name.data(), function_name.size()},
+      &function));
+  IREE_CHECK_OK(iree::ValidateFunctionAbi(function));
+
+  // Construct inputs.
+  auto inputSpecsStatus = iree::ParseInputSignature(function);
+  auto inputs =
+      !absl::GetFlag(FLAGS_inputs_file).empty()
+          ? ParseToVariantListFromFile(inputSpecsStatus.value(),
+                                       iree_hal_device_allocator(device),
+                                       absl::GetFlag(FLAGS_inputs_file))
+          : ParseToVariantList(inputSpecsStatus.value(),
+                               iree_hal_device_allocator(device),
+                               absl::GetFlag(FLAGS_inputs));
+  auto outputDescs = iree::ParseOutputSignature(function);
+
+  if (!outputDescs.ok()) {
+    printf("Can't parse output singture: %s\n",
+           outputDescs.status().ToString().c_str());
+    return 1;
+  }
+
+  // Register function benchmarks...
+  iree::RegisterModuleBenchmarks(function_name, context, function,
+                                 inputs.value().get(), outputDescs.value());
+  // Run benchmarks...
   ::benchmark::RunSpecifiedBenchmarks();
+
+  // Cleanup...
+  iree_vm_module_release(hal_module);
+  iree_vm_module_release(input_module);
+  iree_hal_device_release(device);
+  iree_vm_context_release(context);
+  iree_vm_instance_release(instance);
   return 0;
 }
